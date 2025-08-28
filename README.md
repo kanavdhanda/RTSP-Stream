@@ -1,5 +1,36 @@
 # RTSP single-ingest, multi-consumer pipeline
 
+## Why each choice (TL;DR)
+
+- Problem: Direct OpenCV RTSP greys/stalls under jitter/CPU spikes; you need sub-second UI, reliable frames for multiple Python services, 8+ cameras, and no duplicate pulls.
+- Single-ingest per camera
+	- Why: One decoder per camera saves bandwidth/CPU and keeps consumers in sync.
+	- Outcome: No duplicate camera pulls; one source fans out to many readers.
+- MediaMTX + WebRTC (WHEP) for frontend
+	- Why: Browsers can’t play RTSP; WebRTC is the only practical sub-second option. LL-HLS is fallback only.
+	- Outcome: Smooth, low-latency playback with stable per-camera paths.
+- PyAV/FFmpeg ingest/decode
+	- Why: Low-latency knobs (nobuffer, low_delay, tiny queues, skip_frame=NONKEY) not available in cv2.VideoCapture.
+	- Outcome: Self-heals across jitter; avoids grey frames and backlog.
+- ZeroMQ PUB/SUB for Python CV
+	- Why: Lightweight multi-subscriber fan-out with auto-reconnect; CONFLATE=1 gives “latest-only” frames to avoid latency creep.
+	- Outcome: Multiple CV services get fresh frames without queues growing.
+- JPEG frames to CV
+	- Why: Compact over IPC/network; trivial for OpenCV to decode; good CPU/bandwidth trade-off.
+	- Outcome: Tunable via pub_fps and scale_width per camera.
+- HTTP control plane + de-dup by RTSP URL
+	- Why: Clean start/stop/list orchestration; idempotent control from any client.
+	- Outcome: Canonical names; no duplicate ingest when same URL is requested.
+- VideoCapture-like adapter (capture.py)
+	- Why: Drop-in read()/isOpened() without backlog; minimal changes to pipelines.
+	- Outcome: Always the freshest frame.
+- Watchdogs, timeouts, auto-reconnect
+	- Why: Real networks flake; we restart ffmpeg, bound waits, and auto-reconnect.
+	- Outcome: Robust under jitter and CPU spikes.
+- Scaling
+	- Why: Copy-mode restream + single decode keeps CPU low; drop-late prevents backlog.
+	- Outcome: Practical path to 8+ cameras on modest hardware.
+
 This folder contains a lightweight gateway and clients that pull each camera RTSP once and fan out to:
 
 - Python CV tasks: via a low-latency ZeroMQ PUB/SUB of decoded frames, with a drop-to-latest policy to prevent gray/blocked frames under load.
@@ -7,6 +38,17 @@ This folder contains a lightweight gateway and clients that pull each camera RTS
 Optional: an MJPEG endpoint you can open in a browser to verify delivery.
 
 Why: OpenCV’s direct RTSP capture often gray-screens when CPU spikes or network jitter occurs because the decoder misses reference frames. By centralizing ingest and decoding (PyAV/FFmpeg or GStreamer) and enforcing small buffers and “drop late frames,” consumers stay real-time and robust.
+
+## Why this architecture (at a glance)
+
+- Single-ingest fan-out: Pull each camera once to avoid duplicate bandwidth/CPU and keep all consumers in sync.
+- MediaMTX + WebRTC (WHEP): Browsers can’t play RTSP; WebRTC delivers sub-second latency. LL‑HLS is there only as a fallback.
+- PyAV/FFmpeg decode: Low-latency knobs (nobuffer, low_delay, skip_frame=NONKEY) prevent gray frames and recover fast after jitter.
+- ZeroMQ PUB/SUB for CV: Simple, fast multi-subscriber bus; CONFLATE=1 means “latest frame only” → no backlog, no growing latency. Auto‑reconnect baked in.
+- JPEG frames to CV: Compact over IPC/network and trivial to decode in OpenCV. Tune pub_fps and scale_width to cap CPU/network per camera.
+- HTTP control plane: /cameras/start|stop|list decouples orchestration from data. De‑dup by RTSP URL prevents duplicate ingest.
+- Self‑healing: ffmpeg watchdog + decoder retries + bounded timeouts. Frontend auto‑reconnects on PC drops.
+- Scales to 8+ cameras: Copy mode (no transcode) keeps CPU low; one decode serves many web/CV consumers.
 
 ## Overview
 
@@ -137,4 +179,3 @@ If you prefer manual control, see `consumer_example.py`.
 
 - The gateway de-duplicates by RTSP URL; starting the same URL again returns the existing canonical name.
 - MediaMTX defaults are fine; custom config is optional for ports/auth/TLS.
-# RTSP-Stream
