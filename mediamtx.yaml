@@ -1,0 +1,21 @@
+# Minimal MediaMTX config for single-ingest, multi-output
+# Docs: https://github.com/bluenviron/mediamtx
+
+# Enable WebRTC (WHEP) for ultra-low latency to the browser
+webrtc: yes
+
+# Optional: reduce latency for LL-HLS
+hlsAlwaysRemux: yes
+hlsVariant: lowLatency
+
+# Paths define where streams are pulled from and how they're named
+paths:
+  cam1:
+    # Replace with your camera URL
+    source: rtsp://10.42.0.231/Streaming/Channels/101
+    # Force TCP for stability
+    sourceOnDemand: no
+    sourceProtocol: tcp
+    # Optional auth if needed
+    # sourceOnDemandStartTimeout: 10s
+    # sourceOnDemandCloseAfter: 10s
