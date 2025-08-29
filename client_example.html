@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RTSP Stream Client Example</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .controls {
+            margin-bottom: 20px;
+            padding: 15px;
+            background-color: #f5f5f5;
+            border-radius: 5px;
+        }
+        
+        .control-group {
+            margin-bottom: 10px;
+        }
+        
+        label {
+            display: inline-block;
+            width: 120px;
+            font-weight: bold;
+        }
+        
+        input[type="text"], input[type="number"] {
+            width: 300px;
+            padding: 5px;
+            margin-left: 10px;
+        }
+        
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            margin: 5px;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        
+        button:hover {
+            background-color: #0056b3;
+        }
+        
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        
+        .stop-btn {
+            background-color: #dc3545;
+        }
+        
+        .stop-btn:hover {
+            background-color: #c82333;
+        }
+        
+        .force-stop-btn {
+            background-color: #fd7e14;
+        }
+        
+        .force-stop-btn:hover {
+            background-color: #e66100;
+        }
+        
+        .video-container {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .canvas-container {
+            border: 2px solid #ccc;
+            border-radius: 5px;
+            position: relative;
+        }
+        
+        canvas {
+            display: block;
+            max-width: 100%;
+            height: auto;
+        }
+        
+        .status {
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .status.reconnecting {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+        
+        .status.disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+        }
+        
+        .stats-section {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            border: 1px solid #dee2e6;
+        }
+        
+        .stats-section h3 {
+            margin-top: 0;
+            color: #495057;
+        }
+        
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+        
+        .error-message {
+            background-color: #f8d7da;
+            color: #721c24;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            border: 1px solid #f5c6cb;
+        }
+
+        .streams-list {
+            background-color: #e7f3ff;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h1>RTSP Stream Client Demo</h1>
+    
+    <div class="controls">
+        <div class="control-group">
+            <label>RTSP URL:</label>
+            <input type="text" id="rtspUrl" placeholder="rtsp://your-camera-ip:554/stream" 
+                   value="rtsp://admin:password@192.168.1.100:554/stream">
+        </div>
+        
+        <div class="control-group">
+            <label>Width:</label>
+            <input type="number" id="width" value="640" min="320" max="1920">
+            
+            <label style="margin-left: 20px;">Height:</label>
+            <input type="number" id="height" value="480" min="240" max="1080">
+        </div>
+        
+        <div class="control-group">
+            <label>Server URL:</label>
+            <input type="text" id="serverUrl" value="ws://localhost:8091">
+        </div>
+        
+        <div class="control-group">
+            <button id="startBtn">Start Stream</button>
+            <button id="stopBtn" class="stop-btn" disabled>Stop Stream</button>
+            <button id="forceStopBtn" class="force-stop-btn" disabled>Force Stop</button>
+            <button id="reconnectBtn" disabled>Reconnect</button>
+            <button id="listStreamsBtn">List Streams</button>
+        </div>
+    </div>
+    
+    <div id="status" class="status disconnected">
+        Status: Disconnected
+    </div>
+    
+    <div id="errorMessage" class="error-message" style="display: none;"></div>
+    
+    <div id="streamsList" class="streams-list" style="display: none;">
+        <h3>Active Streams:</h3>
+        <div id="streamsContent"></div>
+    </div>
+    
+    <div class="video-container">
+        <div class="canvas-container">
+            <canvas id="videoCanvas" width="640" height="480"></canvas>
+        </div>
+    </div>
+    
+    <div class="stats">
+        <div class="stats-section">
+            <h3>Client Statistics</h3>
+            <div id="clientStats">
+                <div class="stat-item">
+                    <span>Connection Status:</span>
+                    <span id="connectionStatus">Disconnected</span>
+                </div>
+                <div class="stat-item">
+                    <span>Frames Received:</span>
+                    <span id="framesReceived">0</span>
+                </div>
+                <div class="stat-item">
+                    <span>Bytes Received:</span>
+                    <span id="bytesReceived">0</span>
+                </div>
+                <div class="stat-item">
+                    <span>Average FPS:</span>
+                    <span id="averageFps">0.0</span>
+                </div>
+                <div class="stat-item">
+                    <span>Reconnect Count:</span>
+                    <span id="reconnectCount">0</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="stats-section">
+            <h3>Server Statistics</h3>
+            <div id="serverStats">
+                <div class="stat-item">
+                    <span>Stream ID:</span>
+                    <span id="serverStreamId">N/A</span>
+                </div>
+                <div class="stat-item">
+                    <span>RTSP URL:</span>
+                    <span id="serverRtspUrl">N/A</span>
+                </div>
+                <div class="stat-item">
+                    <span>Is Running:</span>
+                    <span id="serverIsRunning">N/A</span>
+                </div>
+                <div class="stat-item">
+                    <span>Client Count:</span>
+                    <span id="serverClientCount">N/A</span>
+                </div>
+                <div class="stat-item">
+                    <span>Frame Count:</span>
+                    <span id="serverFrameCount">N/A</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="js_client.js"></script>
+    <script>
+        let client = null;
+        let statsInterval = null;
+        
+        // Get DOM elements
+        const canvas = document.getElementById('videoCanvas');
+        const statusDiv = document.getElementById('status');
+        const errorDiv = document.getElementById('errorMessage');
+        const streamsDiv = document.getElementById('streamsList');
+        const streamsContent = document.getElementById('streamsContent');
+        
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const forceStopBtn = document.getElementById('forceStopBtn');
+        const reconnectBtn = document.getElementById('reconnectBtn');
+        const listStreamsBtn = document.getElementById('listStreamsBtn');
+        
+        // Initialize client
+        function initClient() {
+            const serverUrl = document.getElementById('serverUrl').value;
+            client = new RTSPStreamClient(serverUrl);
+            client.setupCanvas(canvas);
+            
+            // Set up event handlers
+            client.onConnect(() => {
+                console.log('Connected to stream');
+                updateStatus('connected', 'Connected and receiving frames');
+                updateButtons(true);
+                hideError();
+                startStatsUpdates();
+            });
+            
+            client.onDisconnect((event) => {
+                console.log('Disconnected from stream', event);
+                const isReconnecting = client.reconnectAttempts > 0 && client.reconnectAttempts < client.maxReconnectAttempts;
+                if (isReconnecting) {
+                    updateStatus('reconnecting', `Reconnecting... (attempt ${client.reconnectAttempts}/${client.maxReconnectAttempts})`);
+                } else {
+                    updateStatus('disconnected', 'Disconnected');
+                    updateButtons(false);
+                    stopStatsUpdates();
+                }
+            });
+            
+            client.onError((error) => {
+                console.error('Stream error:', error);
+                showError(error);
+                if (!client.isConnected) {
+                    updateStatus('disconnected', 'Error occurred');
+                    updateButtons(false);
+                    stopStatsUpdates();
+                }
+            });
+            
+            client.onFrame((frameData, width, height, stats) => {
+                updateClientStats(stats);
+            });
+        }
+        
+        // Update UI status
+        function updateStatus(status, message) {
+            statusDiv.className = `status ${status}`;
+            statusDiv.textContent = `Status: ${message}`;
+        }
+        
+        // Update button states
+        function updateButtons(connected) {
+            startBtn.disabled = connected;
+            stopBtn.disabled = !connected;
+            forceStopBtn.disabled = !connected;
+            reconnectBtn.disabled = !connected;
+        }
+        
+        // Show error message
+        function showError(message) {
+            errorDiv.textContent = `Error: ${message}`;
+            errorDiv.style.display = 'block';
+        }
+        
+        // Hide error message
+        function hideError() {
+            errorDiv.style.display = 'none';
+        }
+        
+        // Update client statistics display
+        function updateClientStats(stats) {
+            if (!stats) return;
+            
+            document.getElementById('connectionStatus').textContent = stats.isConnected ? 'Connected' : 'Disconnected';
+            document.getElementById('framesReceived').textContent = stats.framesReceived.toLocaleString();
+            document.getElementById('bytesReceived').textContent = (stats.bytesReceived / 1024 / 1024).toFixed(2) + ' MB';
+            document.getElementById('averageFps').textContent = stats.averageFps.toFixed(1);
+            document.getElementById('reconnectCount').textContent = stats.reconnectCount;
+        }
+        
+        // Update server statistics display
+        function updateServerStats(serverStats) {
+            if (!serverStats) {
+                document.getElementById('serverStreamId').textContent = 'N/A';
+                document.getElementById('serverRtspUrl').textContent = 'N/A';
+                document.getElementById('serverIsRunning').textContent = 'N/A';
+                document.getElementById('serverClientCount').textContent = 'N/A';
+                document.getElementById('serverFrameCount').textContent = 'N/A';
+                return;
+            }
+            
+            document.getElementById('serverStreamId').textContent = serverStats.stream_id || 'N/A';
+            document.getElementById('serverRtspUrl').textContent = serverStats.rtsp_url || 'N/A';
+            document.getElementById('serverIsRunning').textContent = serverStats.is_running ? 'Yes' : 'No';
+            document.getElementById('serverClientCount').textContent = serverStats.client_count || '0';
+            document.getElementById('serverFrameCount').textContent = (serverStats.frame_count || 0).toLocaleString();
+        }
+        
+        // Start periodic stats updates
+        function startStatsUpdates() {
+            stopStatsUpdates(); // Clear any existing interval
+            statsInterval = setInterval(async () => {
+                if (client && client.isConnected) {
+                    const serverStats = await client.getStreamStats();
+                    updateServerStats(serverStats);
+                    
+                    const clientStats = client.getStats();
+                    updateClientStats(clientStats);
+                }
+            }, 2000); // Update every 2 seconds
+        }
+        
+        // Stop stats updates
+        function stopStatsUpdates() {
+            if (statsInterval) {
+                clearInterval(statsInterval);
+                statsInterval = null;
+            }
+        }
+        
+        // Event handlers
+        startBtn.addEventListener('click', async () => {
+            const rtspUrl = document.getElementById('rtspUrl').value.trim();
+            const width = parseInt(document.getElementById('width').value);
+            const height = parseInt(document.getElementById('height').value);
+            
+            if (!rtspUrl) {
+                showError('Please enter an RTSP URL');
+                return;
+            }
+            
+            hideError();
+            updateStatus('disconnected', 'Starting stream...');
+            
+            initClient();
+            
+            const result = await client.startStreamWithURL(rtspUrl, width, height);
+            if (result.success) {
+                console.log('Stream started:', result);
+                updateStatus('disconnected', 'Connecting to WebSocket...');
+                // Wait a moment for stream to initialize
+                setTimeout(() => {
+                    client.connect();
+                }, 1000);
+            } else {
+                showError(`Failed to start stream: ${result.error}`);
+                updateStatus('disconnected', 'Failed to start stream');
+            }
+        });
+        
+        stopBtn.addEventListener('click', async () => {
+            if (client) {
+                updateStatus('disconnected', 'Stopping stream...');
+                client.disconnect();
+                
+                const result = await client.stopStream();
+                if (result.success) {
+                    console.log('Stream stopped:', result);
+                    updateStatus('disconnected', 'Stream stopped');
+                } else if (result.conflict) {
+                    showError(`Cannot stop stream: ${result.error}`);
+                    updateStatus('disconnected', `Cannot stop - ${result.clientCount} clients connected`);
+                } else {
+                    showError(`Failed to stop stream: ${result.error}`);
+                }
+                
+                updateButtons(false);
+                stopStatsUpdates();
+            }
+        });
+        
+        forceStopBtn.addEventListener('click', async () => {
+            if (client) {
+                updateStatus('disconnected', 'Force stopping stream...');
+                client.disconnect();
+                
+                const result = await client.forceStopStream();
+                if (result.success) {
+                    console.log('Stream force-stopped:', result);
+                    updateStatus('disconnected', 'Stream force-stopped');
+                } else {
+                    showError(`Failed to force stop stream: ${result.error}`);
+                }
+                
+                updateButtons(false);
+                stopStatsUpdates();
+            }
+        });
+        
+        reconnectBtn.addEventListener('click', () => {
+            if (client) {
+                hideError();
+                updateStatus('disconnected', 'Reconnecting...');
+                client.disconnect();
+                setTimeout(() => {
+                    client.connect();
+                }, 1000);
+            }
+        });
+        
+        listStreamsBtn.addEventListener('click', async () => {
+            try {
+                const serverUrl = document.getElementById('serverUrl').value;
+                const tempClient = new RTSPStreamClient(serverUrl);
+                const streams = await tempClient.listStreams();
+                
+                if (streams.length === 0) {
+                    streamsContent.innerHTML = '<p>No active streams found.</p>';
+                } else {
+                    let html = '<ul>';
+                    streams.forEach(stream => {
+                        html += `<li>
+                            <strong>ID:</strong> ${stream.stream_id}<br>
+                            <strong>URL:</strong> ${stream.rtsp_url}<br>
+                            <strong>Running:</strong> ${stream.is_running ? 'Yes' : 'No'}<br>
+                            <strong>Clients:</strong> ${stream.client_count}<br>
+                            <strong>Frames:</strong> ${stream.frame_count.toLocaleString()}
+                        </li><br>`;
+                    });
+                    html += '</ul>';
+                    streamsContent.innerHTML = html;
+                }
+                
+                streamsDiv.style.display = 'block';
+            } catch (error) {
+                showError(`Failed to list streams: ${error.message}`);
+            }
+        });
+        
+        // Initialize empty stats
+        updateClientStats({
+            isConnected: false,
+            framesReceived: 0,
+            bytesReceived: 0,
+            averageFps: 0,
+            reconnectCount: 0
+        });
+        
+        updateServerStats(null);
+        
+        console.log('RTSP Stream Client Demo loaded. Ready to connect to streams.');
+    </script>
+</body>
+</html>

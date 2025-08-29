@@ -50,6 +50,8 @@ type Client struct {
 	conn     *websocket.Conn
 	send     chan []byte
 	manager  *StreamManager
+	closed   bool
+	mu       sync.Mutex
 }
 
 // FrameMessage represents the frame data sent to clients
@@ -205,6 +207,8 @@ func (sm *StreamManager) startFFmpeg(ctx context.Context, stream *Stream, width,
 
 // distributeFrames sends frames from buffer to all connected clients
 func (sm *StreamManager) distributeFrames(stream *Stream) {
+	defer log.Printf("Frame distribution stopped for stream %s", stream.streamID)
+
 	for frame := range stream.frameBuffer {
 		stream.clientsMu.RLock()
 		clients := make([]*Client, 0, len(stream.clients))
@@ -215,12 +219,17 @@ func (sm *StreamManager) distributeFrames(stream *Stream) {
 
 		// Send frame to all clients
 		for _, client := range clients {
-			select {
-			case client.send <- frame:
-			default:
-				// Client buffer full, skip
-				log.Printf("Client %s buffer full, skipping frame", client.id)
+			// Check if client is still active before sending
+			client.mu.Lock()
+			if !client.closed {
+				select {
+				case client.send <- frame:
+				default:
+					// Client buffer full, skip
+					log.Printf("Client %s buffer full, skipping frame", client.id)
+				}
 			}
+			client.mu.Unlock()
 		}
 	}
 }
@@ -238,12 +247,20 @@ func (sm *StreamManager) StopStream(streamID string) error {
 	// Cancel the context to stop FFmpeg
 	stream.cancelFunc()
 
+	// Wait a bit for FFmpeg to stop gracefully
+	time.Sleep(100 * time.Millisecond)
+
 	// Close frame buffer
 	close(stream.frameBuffer)
 
-	// Disconnect all clients
+	// Disconnect all clients safely
 	for _, client := range sm.clients[streamID] {
-		close(client.send)
+		client.mu.Lock()
+		if !client.closed {
+			client.closed = true
+			close(client.send)
+		}
+		client.mu.Unlock()
 		client.conn.Close()
 	}
 
@@ -252,6 +269,7 @@ func (sm *StreamManager) StopStream(streamID string) error {
 	delete(sm.clients, streamID)
 
 	log.Printf("Stopped stream %s", streamID)
+	log.Printf("Frame distribution stopped for stream %s", streamID)
 	return nil
 }
 
@@ -292,13 +310,38 @@ func (sm *StreamManager) RemoveClient(client *Client) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	// Protect against double removal
+	client.mu.Lock()
+	if client.closed {
+		client.mu.Unlock()
+		return
+	}
+	client.closed = true
+	client.mu.Unlock()
+
 	if stream, exists := sm.streams[client.streamID]; exists {
 		stream.clientsMu.Lock()
 		delete(stream.clients, client.id)
 		stream.clientsMu.Unlock()
+
+		// Auto-cleanup: if no clients left, optionally stop the stream
+		// This is commented out to prevent automatic cleanup, but can be enabled if desired
+		/*
+			clientCount := len(stream.clients)
+			if clientCount == 0 {
+				log.Printf("No clients left for stream %s, stopping stream", client.streamID)
+				go func() {
+					// Use a goroutine to avoid deadlock since we already hold sm.mu
+					time.Sleep(100 * time.Millisecond) // Small delay to ensure cleanup
+					sm.StopStream(client.streamID)
+				}()
+			}
+		*/
 	}
 
 	delete(sm.clients[client.streamID], client.id)
+
+	// Safely close the send channel
 	close(client.send)
 
 	log.Printf("Removed client %s from stream %s", client.id, client.streamID)
@@ -333,7 +376,14 @@ func (sm *StreamManager) GetStreamStats(streamID string) (map[string]interface{}
 
 func (c *Client) readPump() {
 	defer func() {
-		c.manager.RemoveClient(c)
+		// Check if client is already closed to avoid double removal
+		c.mu.Lock()
+		alreadyClosed := c.closed
+		c.mu.Unlock()
+
+		if !alreadyClosed {
+			c.manager.RemoveClient(c)
+		}
 		c.conn.Close()
 	}()
 
@@ -367,7 +417,17 @@ func (c *Client) writePump() {
 		case frame, ok := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if !ok {
+				// Channel closed, send close message and exit
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			// Check if client is marked as closed before writing
+			c.mu.Lock()
+			closed := c.closed
+			c.mu.Unlock()
+
+			if closed {
 				return
 			}
 
@@ -378,6 +438,15 @@ func (c *Client) writePump() {
 			}
 
 		case <-ticker.C:
+			// Check if client is marked as closed before sending ping
+			c.mu.Lock()
+			closed := c.closed
+			c.mu.Unlock()
+
+			if closed {
+				return
+			}
+
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
@@ -523,6 +592,43 @@ func (sm *StreamManager) handleStartStreamWithURL(c *gin.Context) {
 func (sm *StreamManager) handleStopStream(c *gin.Context) {
 	streamID := c.Param("streamId")
 
+	// Check if there are still active clients
+	sm.mu.RLock()
+	stream, exists := sm.streams[streamID]
+	if !exists {
+		sm.mu.RUnlock()
+		c.JSON(http.StatusNotFound, gin.H{"error": "Stream not found"})
+		return
+	}
+
+	stream.clientsMu.RLock()
+	clientCount := len(stream.clients)
+	stream.clientsMu.RUnlock()
+	sm.mu.RUnlock()
+
+	if clientCount > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":        fmt.Sprintf("Cannot stop stream %s: %d client(s) still connected", streamID, clientCount),
+			"client_count": clientCount,
+		})
+		return
+	}
+
+	err := sm.StopStream(streamID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":   "Stream stopped successfully",
+		"stream_id": streamID,
+	})
+}
+
+func (sm *StreamManager) handleForceStopStream(c *gin.Context) {
+	streamID := c.Param("streamId")
+
 	err := sm.StopStream(streamID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
@@ -530,7 +636,7 @@ func (sm *StreamManager) handleStopStream(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":   "Stream stopped successfully",
+		"message":   "Stream force-stopped successfully",
 		"stream_id": streamID,
 	})
 }
@@ -581,10 +687,25 @@ func (sm *StreamManager) handleGetFrame(c *gin.Context) {
 		return
 	}
 
+	// Check if stream is actually running
+	stream.mu.RLock()
+	isRunning := stream.isRunning
+	stream.mu.RUnlock()
+
+	if !isRunning {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Stream not running"})
+		return
+	}
+
 	// Wait for a frame with timeout
 	timeout := time.After(5 * time.Second)
 	select {
-	case frame := <-stream.frameBuffer:
+	case frame, ok := <-stream.frameBuffer:
+		if !ok {
+			// Channel closed
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Stream buffer closed"})
+			return
+		}
 		// Return frame as binary data with headers
 		c.Header("Content-Type", "application/octet-stream")
 		c.Header("X-Frame-Timestamp", strconv.FormatInt(time.Now().UnixNano(), 10))
@@ -625,6 +746,7 @@ func main() {
 		api.POST("/streams", sm.handleStartStream)
 		api.POST("/streams/start-with-url", sm.handleStartStreamWithURL)
 		api.DELETE("/streams/:streamId", sm.handleStopStream)
+		api.DELETE("/streams/:streamId/force", sm.handleForceStopStream)
 		api.GET("/streams", sm.handleListStreams)
 		api.GET("/streams/:streamId/stats", sm.handleGetStreamStats)
 		api.GET("/streams/:streamId/frame", sm.handleGetFrame)
@@ -657,7 +779,8 @@ func main() {
 		log.Println("RTSP Stream Server starting on :8091")
 		log.Println("API endpoints:")
 		log.Println("  POST /api/streams - Start a new stream")
-		log.Println("  DELETE /api/streams/:streamId - Stop a stream")
+		log.Println("  DELETE /api/streams/:streamId - Stop a stream (only if no clients)")
+		log.Println("  DELETE /api/streams/:streamId/force - Force stop a stream")
 		log.Println("  GET /api/streams - List all streams")
 		log.Println("  GET /api/streams/:streamId/stats - Get stream statistics")
 		log.Println("  GET /api/streams/:streamId/frame - Get latest frame (HTTP)")

@@ -2,10 +2,10 @@ import React, { useState, useEffect, useRef } from 'react';
 
 /**
  * React component for displaying RTSP streams
- * Compatible with main.go RTSP server
+ * This can be used in your Wails React frontend
  */
 const RTSPStreamViewer = ({ 
-    serverUrl = 'http://localhost:8091', 
+    serverUrl = 'ws://localhost:8080', 
     streamId = 'camera1', 
     rtspUrl = '', 
     width = 640, 
@@ -13,10 +13,11 @@ const RTSPStreamViewer = ({
     autoStart = false 
 }) => {
     const canvasRef = useRef(null);
-    const wsRef = useRef(null);
+    const clientRef = useRef(null);
     
     const [isConnected, setIsConnected] = useState(false);
     const [isStreamActive, setIsStreamActive] = useState(false);
+    const [error, setError] = useState(null);
     const [stats, setStats] = useState({
         framesReceived: 0,
         bytesReceived: 0,
@@ -25,124 +26,126 @@ const RTSPStreamViewer = ({
     });
     const [serverStats, setServerStats] = useState(null);
 
-    // Initialize WebSocket connection
+    // Initialize client
     useEffect(() => {
+        // Import the RTSPStreamClient class
+        const RTSPStreamClient = window.RTSPStreamClient;
+        if (!RTSPStreamClient) {
+            setError('RTSPStreamClient not found. Make sure js_client.js is loaded.');
+            return;
+        }
+
+        const client = new RTSPStreamClient(serverUrl, streamId);
+        clientRef.current = client;
+
+        // Setup canvas
+        if (canvasRef.current) {
+            client.setupCanvas(canvasRef.current);
+        }
+
+        // Setup event handlers
+        client.onConnect(() => {
+            setIsConnected(true);
+            setError(null);
+            console.log(`Connected to stream ${streamId}`);
+        });
+
+        client.onDisconnect(() => {
+            setIsConnected(false);
+            console.log(`Disconnected from stream ${streamId}`);
+        });
+
+        client.onError((error) => {
+            setError(error);
+            console.error(`Stream error: ${error}`);
+        });
+
+        client.onFrame(() => {
+            setStats(client.getStats());
+        });
+
+        // Auto-start if enabled
         if (autoStart && rtspUrl) {
             startStream();
         }
 
         return () => {
-            if (wsRef.current) {
-                wsRef.current.close();
+            if (clientRef.current) {
+                clientRef.current.disconnect();
+                stopStreamOnServer();
             }
         };
     }, [serverUrl, streamId]);
 
     const startStream = async () => {
-        if (!rtspUrl) return;
-        
-        // Start stream on server
-        const response = await fetch(`${serverUrl}/api/streams/start-with-url`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                rtsp_url: rtspUrl,
-                width: width,
-                height: height
-            })
-        });
-        
-        const result = await response.json();
-        const actualStreamId = result.stream_id;
-        
-        setIsStreamActive(true);
-        
-        // Wait for stream to initialize
-        setTimeout(() => {
-            connectWebSocket(actualStreamId);
-        }, 2000);
-    };
+        if (!clientRef.current || !rtspUrl) {
+            setError('Client not initialized or RTSP URL not provided');
+            return;
+        }
 
-    const connectWebSocket = (actualStreamId) => {
-        const wsUrl = serverUrl.replace('http://', 'ws://').replace('https://', 'wss://');
-        const ws = new WebSocket(`${wsUrl}/ws/${actualStreamId}`);
-        wsRef.current = ws;
-
-        ws.onopen = () => {
-            setIsConnected(true);
-        };
-
-        ws.onmessage = (event) => {
-            if (event.data instanceof Blob) {
-                const reader = new FileReader();
-                reader.onload = () => {
-                    displayFrame(new Uint8Array(reader.result));
-                };
-                reader.readAsArrayBuffer(event.data);
+        setError(null);
+        
+        try {
+            // Start stream on server
+            const success = await clientRef.current.startStream(rtspUrl, width, height);
+            if (success) {
+                setIsStreamActive(true);
+                // Wait a moment for stream to initialize
+                setTimeout(() => {
+                    clientRef.current.connect();
+                }, 1000);
+            } else {
+                setError('Failed to start stream on server');
             }
-        };
+        } catch (err) {
+            setError(`Failed to start stream: ${err.message}`);
+        }
+    };
 
-        ws.onclose = () => {
+    const stopStream = async () => {
+        if (!clientRef.current) return;
+
+        try {
+            clientRef.current.disconnect();
+            await stopStreamOnServer();
+            setIsStreamActive(false);
             setIsConnected(false);
-        };
+        } catch (err) {
+            setError(`Failed to stop stream: ${err.message}`);
+        }
     };
 
-    const displayFrame = (frameData) => {
-        if (!canvasRef.current) return;
+    const stopStreamOnServer = async () => {
+        if (!clientRef.current) return;
         
-        const canvas = canvasRef.current;
-        const ctx = canvas.getContext('2d');
-        
-        if (frameData.length !== width * height * 3) return;
-        
-        const imageData = ctx.createImageData(width, height);
-        const data = imageData.data;
-        
-        // Convert BGR to RGBA
-        for (let i = 0; i < width * height; i++) {
-            const bgrIndex = i * 3;
-            const rgbaIndex = i * 4;
-            
-            data[rgbaIndex] = frameData[bgrIndex + 2];     // R
-            data[rgbaIndex + 1] = frameData[bgrIndex + 1]; // G
-            data[rgbaIndex + 2] = frameData[bgrIndex];     // B
-            data[rgbaIndex + 3] = 255;                     // A
+        try {
+            await clientRef.current.stopStream();
+        } catch (err) {
+            console.warn('Error stopping stream on server:', err);
         }
-        
-        ctx.putImageData(imageData, 0, 0);
-        
-        // Update stats
-        setStats(prev => ({
-            framesReceived: prev.framesReceived + 1,
-            bytesReceived: prev.bytesReceived + frameData.length,
-            averageFps: prev.framesReceived / ((Date.now() - (prev.lastFrameTime || Date.now())) / 1000),
-            lastFrameTime: Date.now()
-        }));
-    };
-
-    const stopStream = () => {
-        if (wsRef.current) {
-            wsRef.current.close();
-        }
-        setIsStreamActive(false);
-        setIsConnected(false);
     };
 
     const refreshServerStats = async () => {
-        const response = await fetch(`${serverUrl}/api/streams`);
-        const data = await response.json();
-        if (data.streams && data.streams.length > 0) {
-            setServerStats(data.streams[0]);
+        if (!clientRef.current) return;
+        
+        try {
+            const stats = await clientRef.current.getStreamStats();
+            setServerStats(stats);
+        } catch (err) {
+            console.error('Failed to get server stats:', err);
         }
     };
 
     const resetStats = () => {
-        setStats({
-            framesReceived: 0,
-            bytesReceived: 0,
-            averageFps: 0,
-            lastFrameTime: null
-        });
+        if (clientRef.current) {
+            clientRef.current.resetStats();
+            setStats({
+                framesReceived: 0,
+                bytesReceived: 0,
+                averageFps: 0,
+                lastFrameTime: null
+            });
+        }
     };
 
     const formatBytes = (bytes) => {
@@ -204,6 +207,12 @@ const RTSPStreamViewer = ({
                         WebSocket: {isConnected ? 'Connected' : 'Disconnected'}
                     </span>
                 </div>
+
+                {error && (
+                    <div className="error-message">
+                        Error: {error}
+                    </div>
+                )}
             </div>
 
             <div className="stream-display">
