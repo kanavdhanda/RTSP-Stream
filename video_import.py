@@ -13,8 +13,8 @@ from queue import Queue, Empty
 import hashlib
 import logging
 
-# Set up logging
-logging.basicConfig(level=logging.WARNING)  # Only show warnings/errors
+# Minimize logging
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 class SimpleVideoCapture:
@@ -48,39 +48,32 @@ class SimpleVideoCapture:
         with self._stream_lock:
             # Check if we already know this stream is active
             if self.stream_id in self._active_streams:
-                logger.info(f"Reusing existing stream: {self.stream_id}")
                 self.running = True
                 self._start_fetching()
                 return True
         
-        try:
-            # Always call start-with-url - server will reuse existing stream
-            payload = {
-                "rtsp_url": self.rtsp_url,
-                "width": self.width,
-                "height": self.height
-            }
+        # Always call start-with-url - server will reuse existing stream
+        payload = {
+            "rtsp_url": self.rtsp_url,
+            "width": self.width,
+            "height": self.height
+        }
+        
+        response = self.session.post(f"{self.server_url}/api/streams/start-with-url", json=payload)
+        if response.status_code == 200:
+            result = response.json()
+            self.stream_id = result['stream_id']
             
-            response = self.session.post(f"{self.server_url}/api/streams/start-with-url", json=payload)
-            if response.status_code == 200:
-                result = response.json()
-                self.stream_id = result['stream_id']
+            with self._stream_lock:
+                self._active_streams[self.stream_id] = time.time()
+            
+            # Check if it was already running or newly created
+            if "already running" not in result.get('message', ''):
+                time.sleep(2)  # Wait for new stream to initialize
+            
+            self._start_fetching()
+            return True
                 
-                with self._stream_lock:
-                    self._active_streams[self.stream_id] = time.time()
-                
-                # Check if it was already running or newly created
-                if "already running" in result.get('message', ''):
-                    logger.info(f"Connected to existing stream: {self.stream_id}")
-                else:
-                    logger.info(f"Started new stream: {self.stream_id}")
-                    time.sleep(2)  # Wait for new stream to initialize
-                
-                self._start_fetching()
-                return True
-                
-        except Exception as e:
-            logger.error(f"Failed to ensure stream: {e}")
         return False
     
     def _start_fetching(self):
@@ -92,33 +85,27 @@ class SimpleVideoCapture:
     def _fetch_frames(self):
         """Fetch frames in background"""
         while self.running:
-            try:
-                response = self.session.get(
-                    f"{self.server_url}/api/streams/{self.stream_id}/frame",
-                    timeout=2
-                )
+            response = self.session.get(f"{self.server_url}/api/streams/{self.stream_id}/frame", timeout=2)
+            
+            if response.status_code == 200:
+                frame_data = response.content
+                expected_size = self.width * self.height * 3
                 
-                if response.status_code == 200:
-                    frame_data = response.content
-                    expected_size = self.width * self.height * 3
+                if len(frame_data) == expected_size:
+                    frame = np.frombuffer(frame_data, dtype=np.uint8)
+                    frame = frame.reshape((self.height, self.width, 3))
                     
-                    if len(frame_data) == expected_size:
-                        frame = np.frombuffer(frame_data, dtype=np.uint8)
-                        frame = frame.reshape((self.height, self.width, 3))
-                        
-                        self.current_frame = frame
-                        
-                        # Add to queue
-                        if self.frame_queue.full():
-                            try:
-                                self.frame_queue.get_nowait()
-                            except Empty:
-                                pass
-                        self.frame_queue.put(frame)
-                        
-            except Exception as e:
-                if self.running:
-                    time.sleep(0.1)
+                    self.current_frame = frame
+                    
+                    # Add to queue
+                    if self.frame_queue.full():
+                        try:
+                            self.frame_queue.get_nowait()
+                        except Empty:
+                            pass
+                    self.frame_queue.put(frame)
+            else:
+                time.sleep(0.1)
     
     def read(self):
         """Read a frame - same interface as cv2.VideoCapture"""

@@ -41,10 +41,6 @@ type Stream struct {
 	lastFrameTime time.Time
 	frameCount    int64
 	mu            sync.RWMutex
-	// Error handling
-	lastError  error
-	errorCount int
-	status     string // "starting", "running", "error", "stopped"
 }
 
 // Client represents a connected client consuming a stream
@@ -101,8 +97,6 @@ func (sm *StreamManager) StartStream(streamID, rtspURL string, width, height int
 		clients:     make(map[string]*Client),
 		cancelFunc:  cancel,
 		isRunning:   false,
-		status:      "starting",
-		errorCount:  0,
 	}
 
 	sm.streams[streamID] = stream
@@ -117,50 +111,15 @@ func (sm *StreamManager) StartStream(streamID, rtspURL string, width, height int
 
 // runFFmpegStream runs FFmpeg to capture RTSP stream and output raw frames
 func (sm *StreamManager) runFFmpegStream(ctx context.Context, stream *Stream, width, height int) {
-	retryCount := 0
-	maxRetries := 10
-
 	for {
 		select {
 		case <-ctx.Done():
-			stream.mu.Lock()
-			stream.status = "stopped"
-			stream.mu.Unlock()
 			return
 		default:
 			err := sm.startFFmpeg(ctx, stream, width, height)
-
-			stream.mu.Lock()
 			if err != nil {
-				stream.lastError = err
-				stream.errorCount++
-				stream.status = "error"
-				retryCount++
-
-				log.Printf("FFmpeg error for stream %s (attempt %d/%d): %v",
-					stream.streamID, retryCount, maxRetries, err)
-
-				if retryCount >= maxRetries {
-					stream.status = "failed"
-					stream.mu.Unlock()
-					log.Printf("Stream %s failed after %d attempts", stream.streamID, maxRetries)
-					return
-				}
-			} else {
-				// Reset on successful connection
-				stream.status = "running"
-				stream.lastError = nil
-				retryCount = 0
-			}
-			stream.mu.Unlock()
-
-			if err != nil {
-				// Exponential backoff
-				backoff := time.Duration(retryCount*retryCount) * time.Second
-				if backoff > 30*time.Second {
-					backoff = 30 * time.Second
-				}
-				time.Sleep(backoff)
+				log.Printf("FFmpeg error for stream %s: %v", stream.streamID, err)
+				time.Sleep(2 * time.Second) // Wait before retry
 			}
 		}
 	}
@@ -246,10 +205,6 @@ func (sm *StreamManager) startFFmpeg(ctx context.Context, stream *Stream, width,
 
 // distributeFrames sends frames from buffer to all connected clients
 func (sm *StreamManager) distributeFrames(stream *Stream) {
-	defer func() {
-		log.Printf("Frame distribution stopped for stream %s", stream.streamID)
-	}()
-
 	for frame := range stream.frameBuffer {
 		stream.clientsMu.RLock()
 		clients := make([]*Client, 0, len(stream.clients))
@@ -258,7 +213,7 @@ func (sm *StreamManager) distributeFrames(stream *Stream) {
 		}
 		stream.clientsMu.RUnlock()
 
-		// Send frame to all clients (non-blocking)
+		// Send frame to all clients
 		for _, client := range clients {
 			select {
 			case client.send <- frame:
@@ -280,28 +235,19 @@ func (sm *StreamManager) StopStream(streamID string) error {
 		return fmt.Errorf("stream %s not found", streamID)
 	}
 
-	log.Printf("Stopping stream %s...", streamID)
-
 	// Cancel the context to stop FFmpeg
 	stream.cancelFunc()
-
-	// Kill FFmpeg process if still running
-	if stream.cmd != nil && stream.cmd.Process != nil {
-		stream.cmd.Process.Kill()
-	}
 
 	// Close frame buffer
 	close(stream.frameBuffer)
 
 	// Disconnect all clients
-	stream.clientsMu.Lock()
-	for _, client := range stream.clients {
+	for _, client := range sm.clients[streamID] {
 		close(client.send)
 		client.conn.Close()
 	}
-	stream.clientsMu.Unlock()
 
-	// Cleanup from manager maps
+	// Cleanup
 	delete(sm.streams, streamID)
 	delete(sm.clients, streamID)
 
@@ -601,42 +547,6 @@ func (sm *StreamManager) handleGetStreamStats(c *gin.Context) {
 	c.JSON(http.StatusOK, stats)
 }
 
-func (sm *StreamManager) handleGetStreamStatus(c *gin.Context) {
-	streamID := c.Param("streamId")
-
-	sm.mu.RLock()
-	stream, exists := sm.streams[streamID]
-	sm.mu.RUnlock()
-
-	if !exists {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Stream not found"})
-		return
-	}
-
-	stream.mu.RLock()
-	status := gin.H{
-		"stream_id":    streamID,
-		"rtsp_url":     stream.rtspURL,
-		"status":       stream.status,
-		"is_running":   stream.isRunning,
-		"error_count":  stream.errorCount,
-		"frame_count":  stream.frameCount,
-		"client_count": len(stream.clients),
-	}
-
-	if stream.lastError != nil {
-		status["last_error"] = stream.lastError.Error()
-	}
-
-	if !stream.lastFrameTime.IsZero() {
-		status["last_frame_time"] = stream.lastFrameTime
-		status["seconds_since_last_frame"] = time.Since(stream.lastFrameTime).Seconds()
-	}
-	stream.mu.RUnlock()
-
-	c.JSON(http.StatusOK, status)
-}
-
 func (sm *StreamManager) handleListStreams(c *gin.Context) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -671,8 +581,8 @@ func (sm *StreamManager) handleGetFrame(c *gin.Context) {
 		return
 	}
 
-	// Use a shorter timeout and make it non-blocking
-	timeout := time.After(1 * time.Second) // Reduced from 5 seconds
+	// Wait for a frame with timeout
+	timeout := time.After(5 * time.Second)
 	select {
 	case frame := <-stream.frameBuffer:
 		// Return frame as binary data with headers
@@ -681,10 +591,6 @@ func (sm *StreamManager) handleGetFrame(c *gin.Context) {
 		c.Data(http.StatusOK, "application/octet-stream", frame)
 	case <-timeout:
 		c.JSON(http.StatusRequestTimeout, gin.H{"error": "Timeout waiting for frame"})
-	case <-c.Request.Context().Done():
-		// Handle client disconnect/server shutdown
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Request cancelled"})
-		return
 	}
 }
 
@@ -721,7 +627,6 @@ func main() {
 		api.DELETE("/streams/:streamId", sm.handleStopStream)
 		api.GET("/streams", sm.handleListStreams)
 		api.GET("/streams/:streamId/stats", sm.handleGetStreamStats)
-		api.GET("/streams/:streamId/status", sm.handleGetStreamStatus)
 		api.GET("/streams/:streamId/frame", sm.handleGetFrame)
 	}
 
@@ -769,33 +674,19 @@ func main() {
 	<-quit
 	log.Println("Shutting down server...")
 
-	// Stop all streams first
-	log.Println("Stopping all streams...")
+	// Stop all streams
 	sm.mu.Lock()
 	for streamID := range sm.streams {
-		log.Printf("Stopping stream: %s", streamID)
 		sm.StopStream(streamID)
 	}
 	sm.mu.Unlock()
 
-	// Shutdown server with shorter timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// Shutdown server
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- srv.Shutdown(ctx)
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			log.Printf("Server shutdown error: %v", err)
-		}
-	case <-ctx.Done():
-		log.Println("Server shutdown timeout, forcing exit...")
-		os.Exit(1)
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal("Server forced to shutdown:", err)
 	}
 
-	log.Println("Server exited gracefully")
+	log.Println("Server exited")
 }
