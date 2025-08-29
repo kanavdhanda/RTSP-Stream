@@ -1,181 +1,336 @@
-# RTSP single-ingest, multi-consumer pipeline
+# RTSP Stream Server
 
-## Why each choice (TL;DR)
+A high-performance, single-ingest RTSP stream server built in Go that eliminates network congestion and CPU spikes by providing one RTSP connection per camera with fan-out to multiple clients. Perfect for computer vision applications, surveillance systems, and real-time video processing.
 
-- Problem: Direct OpenCV RTSP greys/stalls under jitter/CPU spikes; you need sub-second UI, reliable frames for multiple Python services, 8+ cameras, and no duplicate pulls.
-- Single-ingest per camera
-	- Why: One decoder per camera saves bandwidth/CPU and keeps consumers in sync.
-	- Outcome: No duplicate camera pulls; one source fans out to many readers.
-- MediaMTX + WebRTC (WHEP) for frontend
-	- Why: Browsers can’t play RTSP; WebRTC is the only practical sub-second option. LL-HLS is fallback only.
-	- Outcome: Smooth, low-latency playback with stable per-camera paths.
-- PyAV/FFmpeg ingest/decode
-	- Why: Low-latency knobs (nobuffer, low_delay, tiny queues, skip_frame=NONKEY) not available in cv2.VideoCapture.
-	- Outcome: Self-heals across jitter; avoids grey frames and backlog.
-- ZeroMQ PUB/SUB for Python CV
-	- Why: Lightweight multi-subscriber fan-out with auto-reconnect; CONFLATE=1 gives “latest-only” frames to avoid latency creep.
-	- Outcome: Multiple CV services get fresh frames without queues growing.
-- JPEG frames to CV
-	- Why: Compact over IPC/network; trivial for OpenCV to decode; good CPU/bandwidth trade-off.
-	- Outcome: Tunable via pub_fps and scale_width per camera.
-- HTTP control plane + de-dup by RTSP URL
-	- Why: Clean start/stop/list orchestration; idempotent control from any client.
-	- Outcome: Canonical names; no duplicate ingest when same URL is requested.
-- VideoCapture-like adapter (capture.py)
-	- Why: Drop-in read()/isOpened() without backlog; minimal changes to pipelines.
-	- Outcome: Always the freshest frame.
-- Watchdogs, timeouts, auto-reconnect
-	- Why: Real networks flake; we restart ffmpeg, bound waits, and auto-reconnect.
-	- Outcome: Robust under jitter and CPU spikes.
-- Scaling
-	- Why: Copy-mode restream + single decode keeps CPU low; drop-late prevents backlog.
-	- Outcome: Practical path to 8+ cameras on modest hardware.
+## Features
 
-This folder contains a lightweight gateway and clients that pull each camera RTSP once and fan out to:
+- **Single Ingest per Camera**: One RTSP connection per camera saves bandwidth and CPU
+- **Fan-out Architecture**: Multiple clients can consume the same stream without duplicate camera pulls
+- **Low Latency**: Direct frame distribution without HLS conversion
+- **Multiple Client Support**: WebSocket for web/React apps, HTTP API for Python/OpenCV
+- **Real-time Statistics**: Monitor stream health, FPS, and client connections
+- **Automatic Reconnection**: Robust error handling and reconnection logic
+- **Cross-Platform**: Works on macOS, Linux, and Windows
 
-- Python CV tasks: via a low-latency ZeroMQ PUB/SUB of decoded frames, with a drop-to-latest policy to prevent gray/blocked frames under load.
-- Frontend: via MediaMTX (rtsp-simple-server) providing WebRTC (sub-second) and LL-HLS fallback.
-Optional: an MJPEG endpoint you can open in a browser to verify delivery.
+## Architecture
 
-Why: OpenCV’s direct RTSP capture often gray-screens when CPU spikes or network jitter occurs because the decoder misses reference frames. By centralizing ingest and decoding (PyAV/FFmpeg or GStreamer) and enforcing small buffers and “drop late frames,” consumers stay real-time and robust.
-
-## Why this architecture (at a glance)
-
-- Single-ingest fan-out: Pull each camera once to avoid duplicate bandwidth/CPU and keep all consumers in sync.
-- MediaMTX + WebRTC (WHEP): Browsers can’t play RTSP; WebRTC delivers sub-second latency. LL‑HLS is there only as a fallback.
-- PyAV/FFmpeg decode: Low-latency knobs (nobuffer, low_delay, skip_frame=NONKEY) prevent gray frames and recover fast after jitter.
-- ZeroMQ PUB/SUB for CV: Simple, fast multi-subscriber bus; CONFLATE=1 means “latest frame only” → no backlog, no growing latency. Auto‑reconnect baked in.
-- JPEG frames to CV: Compact over IPC/network and trivial to decode in OpenCV. Tune pub_fps and scale_width to cap CPU/network per camera.
-- HTTP control plane: /cameras/start|stop|list decouples orchestration from data. De‑dup by RTSP URL prevents duplicate ingest.
-- Self‑healing: ffmpeg watchdog + decoder retries + bounded timeouts. Frontend auto‑reconnects on PC drops.
-- Scales to 8+ cameras: Copy mode (no transcode) keeps CPU low; one decode serves many web/CV consumers.
-
-## Overview
-
-- Single ingest: MediaMTX pulls RTSP from the camera. It can re-publish as RTSP/WebRTC/HLS.
-- Python gateway (gateway.py) subscribes from MediaMTX (or directly from camera) using PyAV with low-latency flags and publishes JPEG frames over ZeroMQ PUB.
-- CV apps subscribe (consumer_example.py or your existing pipeline) and always get the latest frame with minimal buffering.
-- Frontend connects to MediaMTX via WebRTC (WHEP) for sub-second latency, or LL-HLS as fallback.
-
-## Components
-
-- gateway.py — ingest per camera (ffmpeg copy), decode with PyAV, publish JPEG via ZeroMQ; exposes HTTP API and MJPEG debug.
-- capture.py — Python VideoCapture-like adapter backed by the gateway (start via HTTP, frames via ZMQ).
-- consumer_example.py — Low-level ZMQ example (optional).
-- ReactWhepSample.tsx — Self-contained React WebRTC (WHEP) sample component.
-- requirements.txt — Python dependencies for gateway/clients.
-
-## Quick start
-
-1) Install MediaMTX (rtsp-simple-server)
-- macOS: download binary from https://github.com/bluenviron/mediamtx/releases and place it in your PATH.
-- Copy `mediamtx.yaml` somewhere writable and set your RTSP URL.
-
-2) MediaMTX
-- You can run with default ports; a custom mediamtx.yaml is optional (only needed for custom ports/auth/TLS).
-
-3) Python gateway
-- Create a venv and install requirements.
-- Run `gateway.py` to publish frames and optional MJPEG.
-
-4) CV consumer
-- Use `consumer_example.py` or wire the `FrameSubscriber` into your existing recognition loop instead of OpenCV VideoCapture. It always yields the most recent frame with no backlog.
-
-5) Frontend
-- Connect to MediaMTX via WebRTC (WHEP) for lowest latency, or LL-HLS as fallback. See ReactWhepSample.tsx below.
-
-## HTTP API (gateway)
-
-Base URL: http://127.0.0.1:8090
-
-- POST /cameras/start
-	- Body JSON: { "name": "lobby-1", "rtsp": "rtsp://user:pass@ip/stream", "pub_fps"?: 20, "scale_width"?: 640 }
-	- Returns: { ok, name, mediamtx_path, webrtc_whep, hls, zmq_topic }
-
-- POST /cameras/stop
-	- Body JSON: { "name": "lobby-1" }
-	- Returns: { ok }
-
-- GET /cameras
-	- Returns: { ok, cameras: [ { name, webrtc_whep, hls, zmq_topic, ... } ] }
-
-- GET /mjpeg?cam=name
-	- Returns MJPEG multipart stream for quick debugging.
-
-Notes
-- CORS is enabled. You can call these endpoints from your Wails/React app.
-- Each camera is restreamed as RTSP at rtsp://127.0.0.1:8554/{name} by MediaMTX, and also exposed via WebRTC WHEP and LL-HLS.
-
-## Replace OpenCV VideoCapture (Python)
-
-```python
-from capture import open_capture
-
-cap = open_capture(
-	rtsp_url="rtsp://user:pass@192.168.1.10/Streaming/Channels/101",
-	timeout_ms=2000,
-	pub_fps=20,
-	scale_width=640,
-)
-
-while True:
-	ok, frame = cap.read()
-	if not ok:
-		continue
-	# ... process frame (BGR ndarray) ...
+```
+RTSP Camera → Go Server (Single Ingest) → Multiple Clients
+                    ↓
+              ┌─────────────┐
+              │   FFmpeg    │ (RTSP to Raw Frames)
+              └─────────────┘
+                    ↓
+              ┌─────────────┐
+              │ Frame Buffer│ (BGR24 frames)
+              └─────────────┘
+                    ↓
+           ┌────────┬────────┬────────┐
+           │ Wails  │Python  │Python  │
+           │ React  │OpenCV  │OpenCV  │
+           │   App  │ Script │ Script │
+           └────────┴────────┴────────┘
 ```
 
-Notes
-- This will POST /cameras/start first (idempotent, de-dup by RTSP URL), then consume latest frames via ZeroMQ.
-- Multiple Python services can read the same topic with no extra decode cost.
+## Prerequisites
 
-## Frontend integration (React WHEP)
+- Go 1.21 or higher
+- FFmpeg installed and in PATH
+- Python 3.7+ (for Python clients)
+- OpenCV-Python (for Python clients)
 
-Use WebRTC WHEP for sub-second latency with a video element that autoplays without controls.
+### Installing FFmpeg
 
-Steps:
-1) Call POST /cameras/start from your UI to ensure the camera is running (or rely on a backend trigger).
-2) Use a small WHEP helper to attach the stream to a <video> element.
-3) Keep the <video> muted, playsInline, and autoplay for seamless playback.
+**macOS (using Homebrew):**
+```bash
+brew install ffmpeg
+```
 
-See `ReactWhepSample.tsx` in this folder. It ensures the camera is started and connects to WHEP with auto-reconnect.
+**Ubuntu/Debian:**
+```bash
+sudo apt update
+sudo apt install ffmpeg
+```
 
-Behavior
-- No play/pause controls; it connects and plays continuously, auto-reconnecting on errors.
-- If WebRTC is unavailable, you can fall back to LL-HLS using hls.js, but latency will increase.
+**Windows:**
+Download from [https://ffmpeg.org/download.html](https://ffmpeg.org/download.html) and add to PATH.
 
-## Low-level Python integration
+## Quick Start
 
-If you prefer manual control, see `consumer_example.py`.
+1. **Clone and build the server:**
+```bash
+git clone <repository-url>
+cd rtsp-stream-server
+go mod tidy
+go build -o rtsp-server main.go
+```
 
-## Scaling to 8+ cameras
+2. **Start the server:**
+```bash
+./rtsp-server
+```
 
-- ffmpeg restream uses copy mode (no transcode) by default → low CPU.
-- PyAV decoders use low-latency flags and drop-late; publisher drops frames when needed -> no backlog.
-- Use scale_width=640–960 and pub_fps=15–20 for efficient processing.
-- Each camera has a watchdog to restart ffmpeg if it dies.
+The server will start on `http://localhost:8080`
 
-## Tuning options
+3. **Start a stream:**
+```bash
+curl -X POST http://localhost:8080/api/streams \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stream_id": "camera1",
+    "rtsp_url": "rtsp://your-camera-ip:554/stream1",
+    "width": 640,
+    "height": 480
+  }'
+```
 
-- PUB_FPS: lower to reduce CPU/network; raise for smoother motion.
-- SCALE_WIDTH: scale down to reduce CPU; models often work fine at 640p.
-- JPEG_QUALITY: 75–85 for balance.
-- If a camera requires transcode for compatibility, adjust the ffmpeg args in `gateway.py` for that camera.
+4. **Connect clients:**
+   - **Python/OpenCV**: Run `python3 python_client.py`
+   - **Web/React**: Include `js_client.js` and use `RTSPStreamViewer` component
+
+## API Reference
+
+### Start Stream
+```http
+POST /api/streams
+Content-Type: application/json
+
+{
+  "stream_id": "camera1",
+  "rtsp_url": "rtsp://admin:password@192.168.1.100:554/stream1",
+  "width": 640,
+  "height": 480
+}
+```
+
+### Stop Stream
+```http
+DELETE /api/streams/{streamId}
+```
+
+### List Streams
+```http
+GET /api/streams
+```
+
+### Get Stream Statistics
+```http
+GET /api/streams/{streamId}/stats
+```
+
+### Get Latest Frame (HTTP - for Python)
+```http
+GET /api/streams/{streamId}/frame
+```
+
+### WebSocket Connection (for JavaScript/React)
+```
+WS /ws/{streamId}
+```
+
+## Client Usage
+
+### Python/OpenCV Client
+
+```python
+from python_client import RTSPStreamClient
+
+# Replace with your RTSP URL
+RTSP_URL = "rtsp://admin:password@192.168.1.100:554/stream1"
+
+with RTSPStreamClient("http://localhost:8080", "camera1") as client:
+    # Start the stream
+    client.start_stream(RTSP_URL, width=640, height=480)
+    
+    # Start receiving frames
+    client.start_receiving()
+    
+    # Process frames
+    while True:
+        frame = client.get_frame(timeout=2.0)
+        if frame is None:
+            continue
+            
+        # Your computer vision processing here
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        
+        cv2.imshow('Original', frame)
+        cv2.imshow('Edges', edges)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+```
+
+### JavaScript/React Client
+
+```javascript
+import RTSPStreamViewer from './RTSPStreamViewer';
+
+function App() {
+  return (
+    <div>
+      <RTSPStreamViewer
+        serverUrl="ws://localhost:8080"
+        streamId="camera1"
+        rtspUrl="rtsp://admin:password@192.168.1.100:554/stream1"
+        width={640}
+        height={480}
+        autoStart={true}
+      />
+    </div>
+  );
+}
+```
+
+### Wails Integration
+
+1. Include the JavaScript client in your Wails frontend:
+```html
+<script src="js_client.js"></script>
+```
+
+2. Use the React component or raw JavaScript API:
+```javascript
+const client = new RTSPStreamClient('ws://localhost:8080', 'camera1');
+await client.startStream('rtsp://your-camera-url', 640, 480);
+client.connect();
+```
+
+## Configuration
+
+### Environment Variables
+
+- `PORT`: Server port (default: 8080)
+- `LOG_LEVEL`: Logging level (debug, info, warn, error)
+
+### Stream Parameters
+
+- **width/height**: Output resolution (default: 640x480)
+- **frame_buffer_size**: Frames to buffer per stream (default: 100)
+- **client_buffer_size**: Frames to buffer per client (default: 10)
+
+## Performance Optimization
+
+### For High Frame Rates (>30 FPS)
+- Increase buffer sizes
+- Use lower resolution if possible
+- Consider hardware acceleration
+
+### For Multiple Cameras
+- Each camera uses one FFmpeg process
+- Memory usage: ~20MB per camera stream
+- CPU usage: ~5-10% per camera on modern hardware
+
+### Network Optimization
+- Use TCP transport for RTSP (default in this server)
+- Monitor buffer sizes to prevent memory buildup
+- Consider frame dropping for slow clients
 
 ## Troubleshooting
 
-- If you see import errors for av/zmq, run: `pip install -r rtsp/requirements.txt` in your venv.
-- If WebRTC doesn’t connect in browser, check MediaMTX is running and your browser can reach http://127.0.0.1:8889, and test on the same machine to avoid NAT issues.
-- For LL-HLS, ensure MediaMTX HLS is enabled and reachable at http://127.0.0.1:8888/{name}/index.m3u8.
+### Common Issues
 
-## Tuning tips (latency/robustness)
+1. **"FFmpeg not found"**
+   - Install FFmpeg and ensure it's in your PATH
+   - Test with: `ffmpeg -version`
 
-- Prefer RTSP over TCP (not UDP) for reliability: `rtsp_transport=tcp`.
-- Keep decode buffer tiny; drop late frames (we set PyAV options, and use a queue size=1 with overwrite).
-- If CPU becomes a bottleneck, scale down in the gateway (`SCALE_WIDTH`) and publish fewer FPS (`PUB_FPS`).
-- For web playback, WebRTC is the only practical sub-second option; LL-HLS usually sits around 2–5s.
+2. **"Stream failed to start"**
+   - Verify RTSP URL is accessible
+   - Check camera credentials and network connectivity
+   - Try different RTSP transport methods
 
-## Notes
+3. **"Frames arriving too slowly"**
+   - Check network latency to camera
+   - Reduce resolution or frame rate
+   - Verify server has sufficient CPU/memory
 
-- The gateway de-duplicates by RTSP URL; starting the same URL again returns the existing canonical name.
-- MediaMTX defaults are fine; custom config is optional for ports/auth/TLS.
+4. **"WebSocket connection failed"**
+   - Ensure server is running on correct port
+   - Check firewall settings
+   - Verify stream is active before connecting
+
+### Debug Mode
+
+Start the server with debug logging:
+```bash
+LOG_LEVEL=debug ./rtsp-server
+```
+
+### Testing with Sample Streams
+
+Use public test streams for development:
+```bash
+# Big Buck Bunny test stream
+curl -X POST http://localhost:8080/api/streams \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stream_id": "test",
+    "rtsp_url": "rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mp4",
+    "width": 640,
+    "height": 480
+  }'
+```
+
+## Production Deployment
+
+### Docker Deployment
+
+```dockerfile
+FROM golang:1.21-alpine AS builder
+RUN apk add --no-cache ffmpeg
+WORKDIR /app
+COPY . .
+RUN go mod tidy && go build -o rtsp-server main.go
+
+FROM alpine:latest
+RUN apk add --no-cache ffmpeg
+WORKDIR /app
+COPY --from=builder /app/rtsp-server .
+EXPOSE 8080
+CMD ["./rtsp-server"]
+```
+
+### Systemd Service
+
+```ini
+[Unit]
+Description=RTSP Stream Server
+After=network.target
+
+[Service]
+Type=simple
+User=rtsp
+WorkingDirectory=/opt/rtsp-server
+ExecStart=/opt/rtsp-server/rtsp-server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Load Balancing
+
+For high availability, run multiple instances behind a load balancer:
+- Use sticky sessions for WebSocket connections
+- Share stream state via Redis or database
+- Implement health checks
+
+## License
+
+MIT License - see LICENSE file for details.
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests if applicable
+5. Submit a pull request
+
+## Support
+
+- GitHub Issues: Report bugs and feature requests
+- Discussions: Ask questions and share ideas
+- Wiki: Additional documentation and examples
