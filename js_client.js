@@ -873,3 +873,41 @@ if (typeof window !== 'undefined') {
     window.RTSPStreamClient = RTSPStreamClient;
     window.RTSPStreamExamples = RTSPStreamExamples;
 }
+
+/**
+ * Polling function to retrieve frames via HTTP GET request
+ * This is an alternative to WebSocket for environments where WebSocket is not available or reliable.
+ * Usage:
+ *   const streamId = 'your_stream_id';
+ *   const serverUrl = 'http://localhost:8091';
+ *   const width = 640;
+ *   const height = 480;
+ *   
+ *   function onFrameReceived(frameData) {
+ *       // Handle the received frame data (Uint8Array)
+ *   }
+ *   
+ *   function onWaiting() {
+ *       // Called when no frame is available (204 No Content)
+ *   }
+ *   
+ *   pollFrame(streamId, serverUrl, width, height, onFrameReceived, onWaiting);
+ */
+async function pollFrame(streamId, serverUrl, width, height, onFrame, onWaiting) {
+    const frameUrl = `${serverUrl.replace(/^ws/, 'http')}/api/streams/${streamId}/frame`;
+    try {
+        const response = await fetch(frameUrl, { method: 'GET' });
+        if (response.status === 200) {
+            const frameData = await response.arrayBuffer();
+            if (frameData.byteLength === width * height * 3) {
+                onFrame(new Uint8Array(frameData));
+            }
+        } else if (response.status === 204) {
+            // No frame available, call waiting callback
+            if (onWaiting) onWaiting();
+        }
+    } catch (err) {
+        // Network error, retry soon
+    }
+    setTimeout(() => pollFrame(streamId, serverUrl, width, height, onFrame, onWaiting), 100); // 100ms retry
+}

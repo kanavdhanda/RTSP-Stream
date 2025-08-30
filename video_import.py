@@ -95,6 +95,10 @@ class SimpleVideoCapture:
                                 pass
                         self.frame_queue.put(frame)
                         
+                elif response.status_code == 204:
+                    # No frame available, just wait and retry
+                    time.sleep(0.1)
+    
             except Exception as e:
                 if self.running:
                     time.sleep(0.1)

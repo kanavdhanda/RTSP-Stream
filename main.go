@@ -30,17 +30,18 @@ type StreamManager struct {
 
 // Stream represents a single RTSP stream with multiple consumers
 type Stream struct {
-	rtspURL       string
-	streamID      string
-	cmd           *exec.Cmd
-	frameBuffer   chan []byte
-	clients       map[string]*Client
-	clientsMu     sync.RWMutex
-	isRunning     bool
-	cancelFunc    context.CancelFunc
-	lastFrameTime time.Time
-	frameCount    int64
-	mu            sync.RWMutex
+	rtspURL        string
+	streamID       string
+	cmd            *exec.Cmd
+	frameBuffer    chan []byte
+	clients        map[string]*Client
+	clientsMu      sync.RWMutex
+	isRunning      bool
+	cancelFunc     context.CancelFunc
+	lastFrameTime  time.Time
+	frameCount     int64
+	mu             sync.RWMutex
+	healthStopChan chan struct{}
 }
 
 // Client represents a connected client consuming a stream
@@ -93,12 +94,13 @@ func (sm *StreamManager) StartStream(streamID, rtspURL string, width, height int
 	ctx, cancel := context.WithCancel(context.Background())
 
 	stream := &Stream{
-		rtspURL:     rtspURL,
-		streamID:    streamID,
-		frameBuffer: make(chan []byte, 100), // Buffer up to 100 frames
-		clients:     make(map[string]*Client),
-		cancelFunc:  cancel,
-		isRunning:   false,
+		rtspURL:        rtspURL,
+		streamID:       streamID,
+		frameBuffer:    make(chan []byte, 100), // Buffer up to 100 frames
+		clients:        make(map[string]*Client),
+		cancelFunc:     cancel,
+		isRunning:      false,
+		healthStopChan: make(chan struct{}),
 	}
 
 	sm.streams[streamID] = stream
@@ -106,6 +108,7 @@ func (sm *StreamManager) StartStream(streamID, rtspURL string, width, height int
 
 	go sm.runFFmpegStream(ctx, stream, width, height)
 	go sm.distributeFrames(stream)
+	go sm.monitorStreamHealth(stream, width, height)
 
 	log.Printf("Started stream %s from %s", streamID, rtspURL)
 	return nil
@@ -190,7 +193,7 @@ func (sm *StreamManager) startFFmpeg(ctx context.Context, stream *Stream, width,
 			frame := make([]byte, len(frameData))
 			copy(frame, frameData)
 
-			// Send frame to buffer (non-blocking)
+			// Improved buffer: drop oldest frame if full
 			select {
 			case stream.frameBuffer <- frame:
 				stream.mu.Lock()
@@ -198,8 +201,17 @@ func (sm *StreamManager) startFFmpeg(ctx context.Context, stream *Stream, width,
 				stream.frameCount++
 				stream.mu.Unlock()
 			default:
-				// Buffer full, drop frame
-				log.Printf("Frame buffer full for stream %s, dropping frame", stream.streamID)
+				// Buffer full, drop oldest frame and insert new
+				select {
+				case <-stream.frameBuffer:
+				default:
+				}
+				stream.frameBuffer <- frame
+				stream.mu.Lock()
+				stream.lastFrameTime = time.Now()
+				stream.frameCount++
+				stream.mu.Unlock()
+				log.Printf("Frame buffer full for stream %s, dropped oldest frame", stream.streamID)
 			}
 		}
 	}
@@ -246,6 +258,9 @@ func (sm *StreamManager) StopStream(streamID string) error {
 
 	// Cancel the context to stop FFmpeg
 	stream.cancelFunc()
+
+	// Stop health monitor
+	close(stream.healthStopChan)
 
 	// Wait a bit for FFmpeg to stop gracefully
 	time.Sleep(100 * time.Millisecond)
@@ -373,6 +388,36 @@ func (sm *StreamManager) GetStreamStats(streamID string) (map[string]interface{}
 }
 
 // Client methods
+// monitorStreamHealth checks if frames are being received and restarts FFmpeg if stalled
+func (sm *StreamManager) monitorStreamHealth(stream *Stream, width, height int) {
+	const healthCheckInterval = 5 * time.Second
+	const maxStallDuration = 10 * time.Second
+	ticker := time.NewTicker(healthCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stream.healthStopChan:
+			return
+		case <-ticker.C:
+			stream.mu.RLock()
+			lastFrame := stream.lastFrameTime
+			running := stream.isRunning
+			stream.mu.RUnlock()
+			if running && time.Since(lastFrame) > maxStallDuration {
+				log.Printf("Health monitor: Stream %s stalled, restarting FFmpeg", stream.streamID)
+				// Restart FFmpeg by cancelling and starting again
+				stream.cancelFunc()
+				// Create new context and cancelFunc
+				ctx, cancel := context.WithCancel(context.Background())
+				stream.mu.Lock()
+				stream.cancelFunc = cancel
+				stream.isRunning = false
+				stream.mu.Unlock()
+				go sm.runFFmpegStream(ctx, stream, width, height)
+			}
+		}
+	}
+}
 
 func (c *Client) readPump() {
 	defer func() {
@@ -711,7 +756,8 @@ func (sm *StreamManager) handleGetFrame(c *gin.Context) {
 		c.Header("X-Frame-Timestamp", strconv.FormatInt(time.Now().UnixNano(), 10))
 		c.Data(http.StatusOK, "application/octet-stream", frame)
 	case <-timeout:
-		c.JSON(http.StatusRequestTimeout, gin.H{"error": "Timeout waiting for frame"})
+		// Instead of 408, return 204 No Content for smoother client experience
+		c.Status(http.StatusNoContent)
 	}
 }
 
