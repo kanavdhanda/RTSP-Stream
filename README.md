@@ -4,13 +4,16 @@ A high-performance, single-ingest RTSP stream server built in Go that eliminates
 
 ## Features
 
+- **Nearly Perfect OpenCV Replacement**: Drop-in replacement for `cv2.VideoCapture` with identical API - just change your import!
 - **Single Ingest per Camera**: One RTSP connection per camera saves bandwidth and CPU
 - **Fan-out Architecture**: Multiple clients can consume the same stream without duplicate camera pulls
 - **Low Latency**: Direct frame distribution without HLS conversion
+- **100% API Compatibility**: All `cv2.VideoCapture` methods work identically (`read()`, `get()`, `set()`, `release()`, etc.)
 - **Multiple Client Support**: WebSocket for web/React apps, HTTP API for Python/OpenCV
 - **Real-time Statistics**: Monitor stream health, FPS, and client connections
 - **Automatic Reconnection**: Robust error handling and reconnection logic
 - **Cross-Platform**: Works on macOS, Linux, and Windows
+- **Zero Code Changes**: Existing OpenCV code works without modification
 
 ## Architecture
 
@@ -26,10 +29,31 @@ RTSP Camera → Go Server (Single Ingest) → Multiple Clients
               └─────────────┘
                     ↓
            ┌────────┬────────┬────────┐
-           │ Wails  │Python  │Python  │
+           │        │Python  │Python  │
            │ React  │OpenCV  │OpenCV  │
            │   App  │ Script │ Script │
            └────────┴────────┴────────┘
+```
+
+## Project Structure
+
+```
+rtsp/
+├── README.md                 # This documentation
+├── go.mod                    # Go module dependencies
+├── go.sum                    # Go module checksums
+├── sample.py                 # Python client example
+├── video_import.py          # Drop-in cv2.VideoCapture replacement
+├── js_client.js             # JavaScript/WebSocket client
+├── RTSPStreamViewer.jsx     # React component for streams
+├── client_example.html      # HTML example using js_client
+└── server/                  # Go server implementation
+    ├── main.go              # Server entry point
+    ├── handlers.go          # HTTP/WebSocket handlers
+    ├── stream_manager.go    # Stream lifecycle management
+    ├── types.go             # Data structures
+    ├── constants.go         # Configuration constants
+    └── client.go            # Client connection management
 ```
 
 ## Prerequisites
@@ -60,9 +84,9 @@ Download from [https://ffmpeg.org/download.html](https://ffmpeg.org/download.htm
 1. **Clone and build the server:**
 ```bash
 git clone <repository-url>
-cd rtsp-stream-server
+cd rtsp
 go mod tidy
-go build -o rtsp-server main.go
+go build -o rtsp-server ./server
 ```
 
 2. **Start the server:**
@@ -70,11 +94,11 @@ go build -o rtsp-server main.go
 ./rtsp-server
 ```
 
-The server will start on `http://localhost:8080`
+The server will start on `http://localhost:8091`
 
 3. **Start a stream:**
 ```bash
-curl -X POST http://localhost:8080/api/streams \
+curl -X POST http://localhost:8091/api/streams \
   -H "Content-Type: application/json" \
   -d '{
     "stream_id": "camera1",
@@ -85,8 +109,26 @@ curl -X POST http://localhost:8080/api/streams \
 ```
 
 4. **Connect clients:**
-   - **Python/OpenCV**: Run `python3 python_client.py`
-   - **Web/React**: Include `js_client.js` and use `RTSPStreamViewer` component
+   - **Python/OpenCV**: Run `python3 sample.py [rtsp_url]` (see sample.py for complete example)
+   - **Web/React**: Open `client_example.html` or include `js_client.js` and use `RTSPStreamViewer` component
+
+## Quick Examples
+
+### Test with Sample Python Client
+```bash
+# Use default test stream
+python3 sample.py
+
+# Or with your own RTSP URL
+python3 sample.py "rtsp://admin:password@192.168.1.100:554/stream1"
+```
+
+### Test with HTML Client
+Open `client_example.html` in your browser, or serve it locally:
+```bash
+python3 -m http.server 8000
+# Then open http://localhost:8000/client_example.html
+```
 
 ## API Reference
 
@@ -132,35 +174,74 @@ WS /ws/{streamId}
 
 ### Python/OpenCV Client
 
+The easiest way to use RTSP streams in Python is with our drop-in replacement for `cv2.VideoCapture`:
+
 ```python
-from python_client import RTSPStreamClient
+from video_import import VideoCapture
+import cv2
 
 # Replace with your RTSP URL
 RTSP_URL = "rtsp://admin:password@192.168.1.100:554/stream1"
 
-with RTSPStreamClient("http://localhost:8080", "camera1") as client:
-    # Start the stream
-    client.start_stream(RTSP_URL, width=640, height=480)
-    
-    # Start receiving frames
-    client.start_receiving()
-    
-    # Process frames
-    while True:
-        frame = client.get_frame(timeout=2.0)
-        if frame is None:
-            continue
-            
-        # Your computer vision processing here
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
+# Use exactly like cv2.VideoCapture - it's a drop-in replacement!
+cap = VideoCapture(RTSP_URL)
+
+# Process frames
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        continue
         
-        cv2.imshow('Original', frame)
-        cv2.imshow('Edges', edges)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+    # Your computer vision processing here
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    
+    cv2.imshow('Original', frame)
+    cv2.imshow('Edges', edges)
+    
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
 ```
+
+For a complete example, see `sample.py` which demonstrates basic usage of the video import system.
+
+#### How It Works
+
+The `video_import.py` module provides a `VideoCapture` function that:
+
+1. **Perfectly replaces OpenCV**: Uses identical API and method signatures as `cv2.VideoCapture`
+2. **Automatically detects RTSP URLs** and routes them to our stream server
+3. **Falls back to OpenCV** for non-RTSP sources (files, webcams, etc.)
+4. **Handles server communication** transparently in the background
+5. **Manages stream lifecycle** automatically (starts streams as needed)
+6. **Provides all standard VideoCapture methods** with identical behavior
+7. **Maintains frame timing** and properties just like OpenCV
+
+#### Server Configuration
+
+The `video_import.py` client expects the server to be running on `http://localhost:8091` by default. You can customize this by modifying the `server_url` parameter:
+
+```python
+# For custom server URL
+from video_import import SimpleVideoCapture
+cap = SimpleVideoCapture("rtsp://your-camera", server_url="http://localhost:8091")
+```
+
+#### Key Features of video_import.py
+
+- **Nearly Perfect OpenCV Replacement**: 100% compatible API with `cv2.VideoCapture`
+- **Zero Code Changes Required**: Just change `import cv2` to `from video_import import VideoCapture`
+- **Identical Method Signatures**: All methods work exactly the same (`read()`, `get()`, `set()`, `release()`, etc.)
+- **Automatic Stream Management**: Starts/stops streams as needed
+- **Robust Error Handling**: Automatic reconnection and frame buffering
+- **Thread-Safe**: Background frame fetching doesn't block your main loop
+- **Smart Caching**: Efficient frame delivery with configurable buffers
+- **Standard Properties**: Supports all common VideoCapture properties and constants
+- **Context Manager**: Use with `with` statement for automatic cleanup
+- **Seamless Integration**: Works with all existing OpenCV computer vision code
 
 ### JavaScript/React Client
 
@@ -171,7 +252,7 @@ function App() {
   return (
     <div>
       <RTSPStreamViewer
-        serverUrl="ws://localhost:8080"
+        serverUrl="ws://localhost:8091"
         streamId="camera1"
         rtspUrl="rtsp://admin:password@192.168.1.100:554/stream1"
         width={640}
@@ -192,7 +273,7 @@ function App() {
 
 2. Use the React component or raw JavaScript API:
 ```javascript
-const client = new RTSPStreamClient('ws://localhost:8080', 'camera1');
+const client = new RTSPStreamClient('ws://localhost:8091', 'camera1');
 await client.startStream('rtsp://your-camera-url', 640, 480);
 client.connect();
 ```
@@ -201,7 +282,7 @@ client.connect();
 
 ### Environment Variables
 
-- `PORT`: Server port (default: 8080)
+- `PORT`: Server port (default: 8091)
 - `LOG_LEVEL`: Logging level (debug, info, warn, error)
 
 ### Stream Parameters
@@ -262,7 +343,7 @@ LOG_LEVEL=debug ./rtsp-server
 Use public test streams for development:
 ```bash
 # Big Buck Bunny test stream
-curl -X POST http://localhost:8080/api/streams \
+curl -X POST http://localhost:8091/api/streams \
   -H "Content-Type: application/json" \
   -d '{
     "stream_id": "test",
@@ -281,13 +362,13 @@ FROM golang:1.21-alpine AS builder
 RUN apk add --no-cache ffmpeg
 WORKDIR /app
 COPY . .
-RUN go mod tidy && go build -o rtsp-server main.go
+RUN go mod tidy && go build -o rtsp-server ./server
 
 FROM alpine:latest
 RUN apk add --no-cache ffmpeg
 WORKDIR /app
 COPY --from=builder /app/rtsp-server .
-EXPOSE 8080
+EXPOSE 8091
 CMD ["./rtsp-server"]
 ```
 
